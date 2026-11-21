@@ -1,7 +1,8 @@
 // Fast drop-in replacement for csv-reader 1.0.0: run(input) returns exactly the same
-// {columns, rows, errors} for every input, but reads with slice-based scanning instead of
-// one character at a time. The reading policy (broken-row rules, error codes and their
-// order, line counting) is csv-reader 1.0.0's, followed step for step.
+// {columns, rows, errors} for every input. The reading policy (broken-row rules, error
+// codes and their order, line counting) is csv-reader 1.0.0's, followed step for step;
+// the speed comes from slice-based scanning with indexOf jumps between delimiters
+// instead of one character at a time.
 
 const COMMA_END = 0;
 const BREAK_END = 1;
@@ -22,86 +23,74 @@ export function run(input) {
   let recordLine = 1;
   let recordRow = null;
 
+  // The last field read, set by the scan functions (avoids an allocation per field).
+  let fValue = '';
+  let fEnded = EOF_END;
+
+  // Delimiter caches: the index of the next ',', '\n' and '\r' at or after the point
+  // they were computed from, or -1 when none remains. pos only moves forward, so a
+  // cached index behind pos is refreshed and one ahead of pos stays exact.
+  let nComma = text.indexOf(',', 0);
+  let nNl = text.indexOf('\n', 0);
+  let nCr = text.indexOf('\r', 0);
+
   function pushError(code) {
     errors.push({ code, line: recordLine, row: recordRow });
   }
 
-  // Reads unquoted characters onto `value` up to the next comma or line break, dropping a
-  // CR that is not followed by LF (stray_cr). Returns {value, ended, added}; `added` counts
-  // the characters this call kept (beyond the prefix it was handed).
-  function scanUnquoted(value) {
-    const prefixLen = value.length;
+  // Reads unquoted characters onto `prefix` up to the next comma or line break,
+  // dropping a CR that is not followed by LF (stray_cr). Sets fValue and fEnded;
+  // returns how many characters this call kept beyond the prefix.
+  function scanUnquoted(prefix) {
     let segStart = pos;
     let parts = null;
-    while (pos < len) {
-      const c = text.charCodeAt(pos);
-      if (c === 44) { // ,
-        value = parts ? parts.join('') + text.slice(segStart, pos) : value + text.slice(segStart, pos);
-        pos += 1;
-        return { value, ended: COMMA_END, added: value.length - prefixLen };
+    let value = prefix;
+    while (true) {
+      if (nComma !== -1 && nComma < pos) nComma = text.indexOf(',', pos);
+      if (nNl !== -1 && nNl < pos) nNl = text.indexOf('\n', pos);
+      if (nCr !== -1 && nCr < pos) nCr = text.indexOf('\r', pos);
+      let m = -1;
+      let kind = -1;
+      if (nComma !== -1) { m = nComma; kind = 0; }
+      if (nNl !== -1 && (m === -1 || nNl < m)) { m = nNl; kind = 1; }
+      if (nCr !== -1 && (m === -1 || nCr < m)) { m = nCr; kind = 2; }
+      if (m === -1) {
+        fValue = parts ? parts.join('') + text.slice(segStart, len) : value + text.slice(segStart, len);
+        fEnded = EOF_END;
+        pos = len;
+        return fValue.length - prefix.length;
       }
-      if (c === 10) { // \n
-        value = parts ? parts.join('') + text.slice(segStart, pos) : value + text.slice(segStart, pos);
-        pos += 1;
+      if (kind === 0) {
+        fValue = parts ? parts.join('') + text.slice(segStart, m) : value + text.slice(segStart, m);
+        fEnded = COMMA_END;
+        pos = m + 1;
+        return fValue.length - prefix.length;
+      }
+      if (kind === 1) {
+        fValue = parts ? parts.join('') + text.slice(segStart, m) : value + text.slice(segStart, m);
+        fEnded = BREAK_END;
+        pos = m + 1;
         line += 1;
-        return { value, ended: BREAK_END, added: value.length - prefixLen };
+        return fValue.length - prefix.length;
       }
-      if (c === 13) { // \r
-        if (text.charCodeAt(pos + 1) === 10) {
-          value = parts ? parts.join('') + text.slice(segStart, pos) : value + text.slice(segStart, pos);
-          pos += 2;
-          line += 1;
-          return { value, ended: BREAK_END, added: value.length - prefixLen };
-        }
-        // Stray CR: close the current segment, drop the CR, keep scanning.
-        if (!parts) parts = [value];
-        parts.push(text.slice(segStart, pos));
-        value = '';
-        pushError('stray_cr');
-        pos += 1;
-        segStart = pos;
-        continue;
+      if (text.charCodeAt(m + 1) === 10) {
+        fValue = parts ? parts.join('') + text.slice(segStart, m) : value + text.slice(segStart, m);
+        fEnded = BREAK_END;
+        pos = m + 2;
+        line += 1;
+        return fValue.length - prefix.length;
       }
-      pos += 1;
+      // Stray CR: close the current segment, drop the CR, keep scanning.
+      if (!parts) parts = [value];
+      parts.push(text.slice(segStart, m));
+      value = '';
+      pushError('stray_cr');
+      pos = m + 1;
+      segStart = pos;
     }
-    value = parts ? parts.join('') + text.slice(segStart, pos) : value + text.slice(segStart, pos);
-    return { value, ended: EOF_END, added: value.length - prefixLen };
   }
 
-  // One segment of quoted text, text[from..to): counts its line breaks into `lines` and
-  // returns its value with each CRLF or lone CR read as LF. `hasCr` is precomputed by the
-  // caller; without a CR the segment is its own value.
-  function quotedSegment(from, to, hasCr, state) {
-    if (!hasCr) {
-      // Count LFs by hopping between them.
-      let i = from;
-      while (true) {
-        const j = text.indexOf('\n', i);
-        if (j === -1 || j >= to) break;
-        state.lines += 1;
-        i = j + 1;
-      }
-      return text.slice(from, to);
-    }
-    let out = '';
-    let seg = from;
-    let i = from;
-    while (i < to) {
-      const c = text.charCodeAt(i);
-      if (c === 13) {
-        out += text.slice(seg, i) + '\n';
-        state.lines += 1;
-        i += text.charCodeAt(i + 1) === 10 ? 2 : 1;
-        seg = i;
-        continue;
-      }
-      if (c === 10) state.lines += 1;
-      i += 1;
-    }
-    return out + text.slice(seg, to);
-  }
-
-  // Reads a quoted field whose opening quote is at pos.
+  // Reads a quoted field whose opening quote is at pos. Sets fValue and fEnded.
   function scanQuoted() {
     const open = pos;
     const openLine = line;
@@ -109,7 +98,7 @@ export function run(input) {
     let segStart = scanPos;
     let parts = null;
     let value = '';
-    const state = { lines: 0 };
+    let qLines = 0;
     while (true) {
       const q = text.indexOf('"', scanPos);
       if (q === -1) {
@@ -118,25 +107,54 @@ export function run(input) {
         pos = open + 1;
         line = openLine;
         pushError('unterminated_quote');
-        return scanUnquoted('"');
+        scanUnquoted('"');
+        return;
       }
-      const seg = text.slice(segStart, q);
-      const hasCr = seg.indexOf('\r') !== -1;
-      const segValue = hasCr || (parts && parts.length) ? quotedSegment(segStart, q, hasCr, state) : seg;
+      const crIdx = text.indexOf('\r', segStart);
+      const hasCr = crIdx !== -1 && crIdx < q;
       if (!hasCr && !parts) {
-        // Fast path so far: no doubled quote met yet and this segment needs no rewrite.
-        // Still count its LFs.
+        // Fast path: the whole field is one slice; count its LFs by hopping.
         let i = segStart;
         while (true) {
           const j = text.indexOf('\n', i);
           if (j === -1 || j >= q) break;
-          state.lines += 1;
+          qLines += 1;
           i = j + 1;
         }
-        value = segValue;
+        value = text.slice(segStart, q);
       } else {
+        // General path: rewrite CRs to LFs segment by segment, counting lines.
+        let segValue;
+        if (!hasCr) {
+          let i = segStart;
+          while (true) {
+            const j = text.indexOf('\n', i);
+            if (j === -1 || j >= q) break;
+            qLines += 1;
+            i = j + 1;
+          }
+          segValue = text.slice(segStart, q);
+        } else {
+          let out = '';
+          let seg = segStart;
+          let i = segStart;
+          while (i < q) {
+            const c = text.charCodeAt(i);
+            if (c === 13) {
+              out += text.slice(seg, i) + '\n';
+              qLines += 1;
+              i += text.charCodeAt(i + 1) === 10 ? 2 : 1;
+              seg = i;
+              continue;
+            }
+            if (c === 10) qLines += 1;
+            i += 1;
+          }
+          segValue = out + text.slice(seg, q);
+        }
         if (!parts) parts = [value];
         parts.push(segValue);
+        value = '';
       }
       if (text.charCodeAt(q + 1) === 34) {
         // Doubled quote: one literal quote, keep scanning.
@@ -148,32 +166,37 @@ export function run(input) {
         continue;
       }
       // Closing quote.
-      if (parts) value = parts.join('');
-      line += state.lines;
+      fValue = parts ? parts.join('') : value;
+      line += qLines;
       pos = q + 1;
       break;
     }
-    if (pos >= len) return { value, ended: EOF_END };
+    if (pos >= len) {
+      fEnded = EOF_END;
+      return;
+    }
     const c = text.charCodeAt(pos);
     if (c === 44) {
       pos += 1;
-      return { value, ended: COMMA_END };
+      fEnded = COMMA_END;
+      return;
     }
     if (c === 10) {
       pos += 1;
       line += 1;
-      return { value, ended: BREAK_END };
+      fEnded = BREAK_END;
+      return;
     }
     if (c === 13 && text.charCodeAt(pos + 1) === 10) {
       pos += 2;
       line += 1;
-      return { value, ended: BREAK_END };
+      fEnded = BREAK_END;
+      return;
     }
-    // What follows the closing quote is appended as it stands, up to the next comma or
-    // line break.
-    const junk = scanUnquoted(value);
-    if (junk.added > 0) pushError('quote_junk');
-    return junk;
+    // What follows the closing quote is appended as it stands, up to the next comma
+    // or line break.
+    const added = scanUnquoted(fValue);
+    if (added > 0) pushError('quote_junk');
   }
 
   while (true) {
@@ -195,13 +218,13 @@ export function run(input) {
     recordLine = line;
     recordRow = header && columns === null ? null : rows.length;
     const fields = [];
-    let field;
     let quoted = false;
     do {
       quoted = text.charCodeAt(pos) === 34;
-      field = quoted ? scanQuoted() : scanUnquoted('');
-      fields.push(field.value);
-    } while (field.ended === COMMA_END);
+      if (quoted) scanQuoted();
+      else scanUnquoted('');
+      fields.push(fValue);
+    } while (fEnded === COMMA_END);
 
     // A line that held only stray CRs is left with no characters: no record (its
     // stray_cr errors stay).
